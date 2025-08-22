@@ -2,271 +2,275 @@ import os
 import asyncio
 import paramiko
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# --- Konfigurasi ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # ambil dari Environment Variable
-DEFAULT_PASSWORD_RDP = "Warning1@"   # default password RDP
-DEFAULT_PORT_RDP = "6969"            # default port RDP
+# ===============================
+# Environment Variable
+# ===============================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", 8080))  # Zeabur/Render butuh listen ke PORT
 
-# List pilihan OS
-OS_OPTIONS = {
-    "2012": "https://download1588.mediafire.com/.../w2012r2.gz",
-    "2016": "joko/win2016.gz",
-    "2019": "joko/win2019.gz",
-    "2022": "joko/win2022.gz",
-    "custom": None
-}
+# ===============================
+# State Machine Steps
+# ===============================
+CHOOSING_OS, CHOOSING_PASS, CHOOSING_PORT, CONFIRM = range(4)
 
-# --- State sementara untuk tiap user ---
-user_state = {}
-
-
-# === Fungsi SSH eksekusi reinstall ===
-def run_reinstall(ip, root_pass, os_url, rdp_pass, rdp_port):
+# ===============================
+# Fungsi SSH Reinstall
+# ===============================
+async def ssh_reinstall(ip, root_pass, img_url, rdp_pass, rdp_port):
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip, username="root", password=root_pass, timeout=10)
+        ssh.connect(ip, username="root", password=root_pass, timeout=15)
 
-        cmd = (
-            f"bash reinstall.sh dd "
-            f"--rdp-port {rdp_port} "
-            f"--password '{rdp_pass}' "
-            f"--img '{os_url}'"
-        )
-
-        stdin, stdout, stderr = ssh.exec_command(cmd)
-        output = stdout.read().decode() + stderr.read().decode()
+        reinstall_cmd = f"""
+        curl -fsSL https://raw.githubusercontent.com/kripul/reinstall/main/reinstall.sh -o reinstall.sh &&
+        bash reinstall.sh dd --img '{img_url}' --password '{rdp_pass}' --rdp-port '{rdp_port}'
+        """
+        ssh.exec_command(reinstall_cmd)
         ssh.close()
-
-        return True, output
+        return True, None
     except Exception as e:
         return False, str(e)
 
-
-# === Command /warn ===
-async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===============================
+# Command /warn <IP> <ROOT_PASS>
+# ===============================
+async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Format salah.\nGunakan:\n`/warn <IP> <ROOT_PASS>`", parse_mode="Markdown")
-        return
+        await update.message.reply_text("Format: /warn <IP> <ROOT_PASS>")
+        return ConversationHandler.END
 
-    ip, root_pass = context.args[0], context.args[1]
+    ip = context.args[0]
+    root_pass = context.args[1]
+    context.user_data["ip"] = ip
+    context.user_data["root_pass"] = root_pass
 
-    # Simpan state user
-    user_state[update.effective_chat.id] = {
-        "ip": ip,
-        "root_pass": root_pass,
-        "os": None,
-        "rdp_pass": None,
-        "rdp_port": None
-    }
-
-    # Inline menu pilihan OS
+    # Pilihan OS (ISO)
     keyboard = [
-        [InlineKeyboardButton("Windows 2012", callback_data="os_2012")],
-        [InlineKeyboardButton("Windows 2016", callback_data="os_2016")],
-        [InlineKeyboardButton("Windows 2019", callback_data="os_2019")],
-        [InlineKeyboardButton("Windows 2022", callback_data="os_2022")],
-        [InlineKeyboardButton("Custom URL", callback_data="os_custom")]
+        [InlineKeyboardButton("Windows 2012", callback_data="os_win2012")],
+        [InlineKeyboardButton("Windows 2016", callback_data="os_win2016")],
+        [InlineKeyboardButton("Windows 2019", callback_data="os_win2019")],
+        [InlineKeyboardButton("Windows 2022", callback_data="os_win2022")],
+        [InlineKeyboardButton("Custom URL", callback_data="os_custom")],
     ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
-        f"🖥️ Reinstall VPS `{ip}`\n\nPilih OS yang ingin diinstall:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "Pilih OS yang ingin diinstall:", reply_markup=reply_markup
     )
+    return CHOOSING_OS
 
-
-# === Handler tombol OS ===
+# ===============================
+# Handler Pilihan OS
+# ===============================
 async def os_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
 
-    state = user_state.get(chat_id)
-    if not state:
-        await query.edit_message_text("⚠️ Session tidak ditemukan. Jalankan ulang perintah `/warn`.")
-        return
+    os_map = {
+        "os_win2012": "https://download1588.mediafire.com/.../w2012r2.gz",
+        "os_win2016": "joko/win2016.gz",
+        "os_win2019": "joko/win2019.gz",
+        "os_win2022": "joko/win2022.gz",
+    }
 
-    choice = query.data.replace("os_", "")
-    if choice == "custom":
-        state["os"] = "custom"
-        await query.edit_message_text("🔗 Kirim URL ISO kustom untuk VPS:")
-        return
+    if query.data == "os_custom":
+        await query.edit_message_text("Kirim URL ISO kustom:")
+        return CHOOSING_OS
     else:
-        state["os"] = OS_OPTIONS[choice]
+        context.user_data["img_url"] = os_map[query.data]
 
-    # Lanjut ke input password RDP
+    # Pilih Password RDP
     keyboard = [
-        [InlineKeyboardButton("Gunakan default", callback_data="rdp_pass_default")],
-        [InlineKeyboardButton("Input manual", callback_data="rdp_pass_manual")]
+        [InlineKeyboardButton("Gunakan Default (Warning1@)", callback_data="pass_default")],
+        [InlineKeyboardButton("Masukkan Manual", callback_data="pass_manual")],
     ]
-    await query.edit_message_text(
-        f"🔑 Atur password RDP (default: `{DEFAULT_PASSWORD_RDP}`)",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
+    await query.edit_message_text("Pilih password RDP:", reply_markup=reply_markup)
+    return CHOOSING_PASS
 
-# === Handler custom URL ===
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = user_state.get(chat_id)
-
-    if state and state.get("os") == "custom" and not state.get("rdp_pass"):
-        url = update.message.text.strip()
-        if url.startswith("http://") or url.startswith("https://"):
-            state["os"] = url
-            # Lanjut ke input password RDP
-            keyboard = [
-                [InlineKeyboardButton("Gunakan default", callback_data="rdp_pass_default")],
-                [InlineKeyboardButton("Input manual", callback_data="rdp_pass_manual")]
-            ]
-            await update.message.reply_text(
-                f"🔑 Atur password RDP (default: `{DEFAULT_PASSWORD_RDP}`)",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        else:
-            await update.message.reply_text("❌ URL tidak valid. Pastikan diawali dengan http:// atau https://")
-
-
-# === Handler password RDP ===
-async def rdp_pass_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===============================
+# Handler Password
+# ===============================
+async def pass_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
-    state = user_state.get(chat_id)
 
-    if query.data == "rdp_pass_default":
-        state["rdp_pass"] = DEFAULT_PASSWORD_RDP
-    else:
-        await query.edit_message_text("✍️ Kirim password RDP yang ingin digunakan:")
-        return
+    if query.data == "pass_default":
+        context.user_data["rdp_pass"] = "Warning1@"
 
-    # Lanjut ke port RDP
-    keyboard = [
-        [InlineKeyboardButton("Gunakan default", callback_data="rdp_port_default")],
-        [InlineKeyboardButton("Input manual", callback_data="rdp_port_manual")]
-    ]
-    await query.edit_message_text(
-        f"🔌 Atur port RDP (default: `{DEFAULT_PORT_RDP}`)",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# === Handler manual password RDP ===
-async def handle_rdp_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = user_state.get(chat_id)
-
-    if state and not state.get("rdp_pass"):
-        state["rdp_pass"] = update.message.text.strip()
-        # Lanjut ke port RDP
+        # lanjut pilih port
         keyboard = [
-            [InlineKeyboardButton("Gunakan default", callback_data="rdp_port_default")],
-            [InlineKeyboardButton("Input manual", callback_data="rdp_port_manual")]
+            [InlineKeyboardButton("Gunakan Default (6969)", callback_data="port_default")],
+            [InlineKeyboardButton("Masukkan Manual", callback_data="port_manual")],
         ]
-        await update.message.reply_text(
-            f"🔌 Atur port RDP (default: `{DEFAULT_PORT_RDP}`)",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
+        await query.edit_message_text("Pilih port RDP:", reply_markup=reply_markup)
+        return CHOOSING_PORT
 
-# === Handler port RDP ===
-async def rdp_port_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    elif query.data == "pass_manual":
+        await query.edit_message_text("Kirim password RDP manual:")
+        return CHOOSING_PASS
+
+async def set_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["rdp_pass"] = update.message.text
+
+    # lanjut pilih port
+    keyboard = [
+        [InlineKeyboardButton("Gunakan Default (6969)", callback_data="port_default")],
+        [InlineKeyboardButton("Masukkan Manual", callback_data="port_manual")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text("Pilih port RDP:", reply_markup=reply_markup)
+    return CHOOSING_PORT
+
+# ===============================
+# Handler Port
+# ===============================
+async def port_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat.id
-    state = user_state.get(chat_id)
 
-    if query.data == "rdp_port_default":
-        state["rdp_port"] = DEFAULT_PORT_RDP
-        await execute_reinstall(query, state)
+    if query.data == "port_default":
+        context.user_data["rdp_port"] = "6969"
+
+        return await confirm_settings(query, context)
+
+    elif query.data == "port_manual":
+        await query.edit_message_text("Kirim port RDP manual (1024-65535):")
+        return CHOOSING_PORT
+
+async def set_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    port = update.message.text
+    if port.isdigit() and 1024 <= int(port) <= 65535:
+        context.user_data["rdp_port"] = port
+        return await confirm_settings(update, context)
     else:
-        await query.edit_message_text("✍️ Kirim port RDP (1024–65535):")
+        await update.message.reply_text("Port tidak valid, coba lagi:")
+        return CHOOSING_PORT
 
+# ===============================
+# Konfirmasi
+# ===============================
+async def confirm_settings(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    ip = context.user_data["ip"]
+    root_pass = context.user_data["root_pass"]
+    img_url = context.user_data["img_url"]
+    rdp_pass = context.user_data["rdp_pass"]
+    rdp_port = context.user_data["rdp_port"]
 
-# === Handler manual port RDP ===
-async def handle_rdp_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = user_state.get(chat_id)
-
-    if state and not state.get("rdp_port"):
-        port = update.message.text.strip()
-        if port.isdigit() and 1024 <= int(port) <= 65535:
-            state["rdp_port"] = port
-            await execute_reinstall(update, state)
-        else:
-            await update.message.reply_text("❌ Port tidak valid. Masukkan angka antara 1024–65535.")
-
-
-# === Eksekusi reinstall ===
-async def execute_reinstall(source, state):
-    ip = state["ip"]
-    root_pass = state["root_pass"]
-    os_url = state["os"]
-    rdp_pass = state["rdp_pass"]
-    rdp_port = state["rdp_port"]
-
-    msg = (
-        f"🚀 Memulai reinstall VPS `{ip}`...\n\n"
-        f"🖥️ OS: {os_url}\n"
-        f"🔑 RDP Pass: {rdp_pass}\n"
-        f"🔌 RDP Port: {rdp_port}"
+    text = (
+        f"⚡ Konfirmasi reinstall VPS:\n"
+        f"IP: {ip}\n"
+        f"Root Pass: {root_pass}\n"
+        f"IMG: {img_url}\n"
+        f"RDP Pass: {rdp_pass}\n"
+        f"RDP Port: {rdp_port}\n\n"
+        f"Lanjutkan?"
     )
 
-    if isinstance(source, Update):
-        await source.message.reply_text(msg, parse_mode="Markdown")
+    keyboard = [
+        [InlineKeyboardButton("✅ Ya, lanjutkan", callback_data="confirm_yes")],
+        [InlineKeyboardButton("❌ Batal", callback_data="confirm_no")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if isinstance(update_or_query, Update):
+        await update_or_query.message.reply_text(text, reply_markup=reply_markup)
     else:
-        await source.edit_message_text(msg, parse_mode="Markdown")
+        await update_or_query.edit_message_text(text, reply_markup=reply_markup)
 
-    ok, result = run_reinstall(ip, root_pass, os_url, rdp_pass, rdp_port)
+    return CONFIRM
 
+# ===============================
+# Handler Konfirmasi
+# ===============================
+async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "confirm_no":
+        await query.edit_message_text("❌ Reinstall dibatalkan.")
+        return ConversationHandler.END
+
+    ip = context.user_data["ip"]
+    root_pass = context.user_data["root_pass"]
+    img_url = context.user_data["img_url"]
+    rdp_pass = context.user_data["rdp_pass"]
+    rdp_port = context.user_data["rdp_port"]
+
+    await query.edit_message_text("🔄 Sedang menjalankan reinstall...")
+
+    ok, err = await ssh_reinstall(ip, root_pass, img_url, rdp_pass, rdp_port)
     if ok:
-        text = (
-            f"✅ Reinstall berhasil dijalankan!\n\n"
-            f"📡 Cek progres di browser:\nhttp://{ip}\n\n"
-            f"ℹ️ VPS akan reboot otomatis setelah selesai."
+        await query.message.reply_text(
+            f"✅ Reinstall dimulai di {ip}.\n"
+            f"👉 Cek progres: http://{ip}\n"
+            f"RDP Port: {rdp_port}\nRDP Pass: {rdp_pass}"
         )
     else:
-        text = f"❌ Gagal menjalankan reinstall:\n{result}"
+        await query.message.reply_text(f"❌ Gagal: {err}")
 
-    if isinstance(source, Update):
-        await source.message.reply_text(text)
-    else:
-        await source.edit_message_text(text)
+    return ConversationHandler.END
 
+# ===============================
+# Fallback
+# ===============================
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Dibatalkan.")
+    return ConversationHandler.END
 
-# === Main Bot ===
-async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+# ===============================
+# HTTP Server Dummy (untuk Render/Zeabur)
+# ===============================
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
 
-    app.add_handler(CommandHandler("warn", warn_command))
-    app.add_handler(CallbackQueryHandler(os_choice, pattern="^os_"))
-    app.add_handler(CallbackQueryHandler(rdp_pass_choice, pattern="^rdp_pass_"))
-    app.add_handler(CallbackQueryHandler(rdp_port_choice, pattern="^rdp_port_"))
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("👋 Halo! Gunakan /warn <IP> <ROOT_PASS>")))
-    app.add_handler(CommandHandler("help", lambda u, c: u.message.reply_text("ℹ️ Gunakan /warn <IP> <ROOT_PASS> untuk reinstall VPS")))
+def run_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), SimpleHandler)
+    server.serve_forever()
 
-    # Handler input text
-    app.add_handler(
-        # Custom OS URL
-        telegram.ext.MessageHandler(telegram.ext.filters.TEXT & ~telegram.ext.filters.COMMAND, handle_text)
+# ===============================
+# Main
+# ===============================
+def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("warn", warn)],
+        states={
+            CHOOSING_OS: [
+                CallbackQueryHandler(os_choice, pattern="^os_"),
+                MessageHandler(None, os_choice),
+            ],
+            CHOOSING_PASS: [
+                CallbackQueryHandler(pass_choice, pattern="^pass_"),
+                MessageHandler(None, set_pass),
+            ],
+            CHOOSING_PORT: [
+                CallbackQueryHandler(port_choice, pattern="^port_"),
+                MessageHandler(None, set_port),
+            ],
+            CONFIRM: [CallbackQueryHandler(confirm, pattern="^confirm_")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
-    app.add_handler(
-        # Manual RDP Pass
-        telegram.ext.MessageHandler(telegram.ext.filters.TEXT & ~telegram.ext.filters.COMMAND, handle_rdp_pass)
-    )
-    app.add_handler(
-        # Manual RDP Port
-        telegram.ext.MessageHandler(telegram.ext.filters.TEXT & ~telegram.ext.filters.COMMAND, handle_rdp_port)
-    )
 
-    await app.run_polling()
+    application.add_handler(conv_handler)
 
+    # Jalankan bot dan HTTP server bersamaan
+    loop = asyncio.get_event_loop()
+    loop.create_task(application.run_polling())
+    run_http_server()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
