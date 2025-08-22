@@ -1,1 +1,1 @@
-worker: python bot_reinstall.py
+web: python bot_reinstall.py
