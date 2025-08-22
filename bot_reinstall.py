@@ -1,228 +1,213 @@
-import asyncio
-import logging
+import os
 import paramiko
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     ContextTypes,
     CallbackQueryHandler,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# --- CONFIG ---
-BOT_TOKEN = "8260974320:AAFJP2sGaXwWNz372eaH7YH_s9fqGLWuoSU"
-DEFAULT_RDP_PASS = "Warning1@"
-DEFAULT_RDP_PORT = "6969"
+# --- Konfigurasi ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# --- LOGGER ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Simpan state sementara
+user_state = {}
 
-# --- STATES ---
-CHOOSE_OS, CHOOSE_PASS, CHOOSE_PORT, CONFIRM = range(4)
+# --- Dummy HTTP server untuk Render ---
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
 
-# --- Pilihan OS ---
-OS_OPTIONS = {
-    "Windows 2012": "https://example.com/win2012.gz",
-    "Windows 2016": "https://example.com/win2016.gz",
-    "Windows 2019": "https://example.com/win2019.gz",
-    "Windows 2022": "https://example.com/win2022.gz",
-    "Custom ISO": "CUSTOM",
-}
+def run_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), DummyHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_http_server, daemon=True).start()
 
 # --- Command /warn ---
-async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("⚠️ Gunakan format:\n`/warn <IP> <ROOT_PASS>`", parse_mode="Markdown")
-        return ConversationHandler.END
+async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.message.reply_text("Format salah!\nGunakan: /warn <IP> <ROOT_PASS>")
+        return
 
-    ip = context.args[0]
-    root_pass = context.args[1]
+    ip, root_pass = context.args
+    user_id = update.effective_user.id
+    user_state[user_id] = {"ip": ip, "root_pass": root_pass}
 
-    context.user_data["ip"] = ip
-    context.user_data["root_pass"] = root_pass
-
+    # Pilihan OS
     keyboard = [
-        [InlineKeyboardButton(name, callback_data=f"os|{key}")]
-        for key, name in enumerate(OS_OPTIONS.keys())
+        [InlineKeyboardButton("Windows 2012", callback_data="os_win2012")],
+        [InlineKeyboardButton("Windows 2016", callback_data="os_win2016")],
+        [InlineKeyboardButton("Windows 2019", callback_data="os_win2019")],
+        [InlineKeyboardButton("Windows 2022", callback_data="os_win2022")],
+        [InlineKeyboardButton("Custom URL", callback_data="os_custom")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        f"Reinstall VPS {ip}\n\nPilih OS yang ingin diinstall:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
-    await update.message.reply_text("🖥️ Pilih OS untuk reinstall VPS:", reply_markup=reply_markup)
-    return CHOOSE_OS
-
-# --- Pilih OS ---
+# --- Handler pilih OS ---
 async def choose_os(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = query.from_user.id
+    state = user_state.get(user_id)
 
-    _, os_key = query.data.split("|")
-    os_name = list(OS_OPTIONS.keys())[int(os_key)]
-    context.user_data["os"] = os_name
+    os_map = {
+        "os_win2012": "https://download1588.mediafire.com/.../w2012r2.gz",
+        "os_win2016": "joko/win2016.gz",
+        "os_win2019": "joko/win2019.gz",
+        "os_win2022": "joko/win2022.gz",
+    }
 
+    if query.data == "os_custom":
+        await query.edit_message_text("Kirim URL ISO custom:")
+        state["next"] = "awaiting_custom_url"
+        return
+
+    state["os_url"] = os_map.get(query.data)
+    await ask_rdp_password(query, state)
+
+async def handle_custom_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_state.get(user_id)
+    if state and state.get("next") == "awaiting_custom_url":
+        url = update.message.text.strip()
+        if not url.startswith("http"):
+            await update.message.reply_text("URL tidak valid, harus mulai dengan http/https.")
+            return
+        state["os_url"] = url
+        await ask_rdp_password(update.message, state)
+
+# --- Input password RDP ---
+async def ask_rdp_password(target, state):
     keyboard = [
-        [InlineKeyboardButton("Gunakan default", callback_data="pass|default")],
-        [InlineKeyboardButton("Input manual", callback_data="pass|manual")],
+        [InlineKeyboardButton("Gunakan default (Warning1@)", callback_data="pass_default")],
+        [InlineKeyboardButton("Input manual", callback_data="pass_manual")],
     ]
-    await query.edit_message_text(f"🔑 Pilih metode password RDP:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return CHOOSE_PASS
+    await target.reply_text("Pilih password RDP:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Pilih Password ---
 async def choose_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    _, method = query.data.split("|")
+    user_id = query.from_user.id
+    state = user_state.get(user_id)
 
-    if method == "default":
-        context.user_data["rdp_pass"] = DEFAULT_RDP_PASS
-        return await ask_port(query, context)
-
-    else:  # manual
-        await query.edit_message_text(f"Ketik password RDP (Enter kosong = {DEFAULT_RDP_PASS}):")
-        return CHOOSE_PASS
-
-async def save_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text.strip() if update.message.text.strip() else DEFAULT_RDP_PASS
-    context.user_data["rdp_pass"] = password
-    return await ask_port(update.message, context)
-
-# --- Pilih Port ---
-async def ask_port(source, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Gunakan default", callback_data="port|default")],
-        [InlineKeyboardButton("Input manual", callback_data="port|manual")],
-    ]
-    if hasattr(source, "reply_text"):
-        await source.reply_text("🔌 Pilih metode port RDP:", reply_markup=InlineKeyboardMarkup(keyboard))
+    if query.data == "pass_default":
+        state["rdp_pass"] = "Warning1@"
+        await ask_rdp_port(query, state)
     else:
-        await source.edit_message_text("🔌 Pilih metode port RDP:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return CHOOSE_PORT
+        await query.edit_message_text("Ketik password RDP yang kamu inginkan (kosong = default Warning1@):")
+        state["next"] = "awaiting_rdp_pass"
+
+async def handle_pass_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_state.get(user_id)
+    if state and state.get("next") == "awaiting_rdp_pass":
+        txt = update.message.text.strip()
+        state["rdp_pass"] = txt if txt else "Warning1@"
+        await ask_rdp_port(update.message, state)
+
+# --- Input port RDP ---
+async def ask_rdp_port(target, state):
+    keyboard = [
+        [InlineKeyboardButton("Gunakan default (6969)", callback_data="port_default")],
+        [InlineKeyboardButton("Input manual", callback_data="port_manual")],
+    ]
+    await target.reply_text("Pilih port RDP:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def choose_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    _, method = query.data.split("|")
+    user_id = query.from_user.id
+    state = user_state.get(user_id)
 
-    if method == "default":
-        context.user_data["rdp_port"] = DEFAULT_RDP_PORT
-        return await confirm_reinstall(query, context)
-
+    if query.data == "port_default":
+        state["rdp_port"] = "6969"
+        await confirm_reinstall(query, state)
     else:
-        await query.edit_message_text(f"Ketik port RDP (Enter kosong = {DEFAULT_RDP_PORT}):")
-        return CHOOSE_PORT
+        await query.edit_message_text("Ketik port RDP (1024–65535, kosong = 6969):")
+        state["next"] = "awaiting_rdp_port"
 
-async def save_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    port = update.message.text.strip() if update.message.text.strip() else DEFAULT_RDP_PORT
-    context.user_data["rdp_port"] = port
-    return await confirm_reinstall(update.message, context)
+async def handle_port_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_state.get(user_id)
+    if state and state.get("next") == "awaiting_rdp_port":
+        txt = update.message.text.strip()
+        if not txt:
+            state["rdp_port"] = "6969"
+        elif txt.isdigit() and 1024 <= int(txt) <= 65535:
+            state["rdp_port"] = txt
+        else:
+            await update.message.reply_text("Port tidak valid, masukkan angka 1024–65535 atau kosong untuk default.")
+            return
+        await confirm_reinstall(update.message, state)
 
 # --- Konfirmasi ---
-async def confirm_reinstall(source, context: ContextTypes.DEFAULT_TYPE):
-    data = context.user_data
+async def confirm_reinstall(target, state):
+    ip, os_url, rdp_pass, rdp_port = state["ip"], state["os_url"], state["rdp_pass"], state["rdp_port"]
     msg = (
-        f"⚡ Konfirmasi reinstall VPS ⚡\n\n"
-        f"📡 IP VPS: {data['ip']}\n"
-        f"🔑 Root Pass: {data['root_pass']}\n"
-        f"🖥️ OS: {data['os']}\n"
-        f"🔐 RDP Pass: {data['rdp_pass']}\n"
-        f"🔌 RDP Port: {data['rdp_port']}\n\n"
-        f"Lanjutkan reinstall?"
+        f"Konfirmasi reinstall VPS:\n\n"
+        f"IP: {ip}\n"
+        f"OS: {os_url}\n"
+        f"RDP Pass: {rdp_pass}\n"
+        f"RDP Port: {rdp_port}\n\n"
+        f"Klik OK untuk mulai reinstall."
     )
-    keyboard = [
-        [InlineKeyboardButton("✅ YA", callback_data="confirm|yes")],
-        [InlineKeyboardButton("❌ BATAL", callback_data="confirm|no")],
-    ]
-    if hasattr(source, "reply_text"):
-        await source.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        await source.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
-    return CONFIRM
+    keyboard = [[InlineKeyboardButton("✅ OK", callback_data="do_reinstall")]]
+    await target.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# --- Eksekusi Reinstall ---
+# --- Eksekusi reinstall ---
 async def do_reinstall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    _, choice = query.data.split("|")
+    user_id = query.from_user.id
+    state = user_state.get(user_id)
 
-    if choice == "no":
-        await query.edit_message_text("❌ Reinstall dibatalkan.")
-        return ConversationHandler.END
+    ip, root_pass = state["ip"], state["root_pass"]
+    os_url, rdp_pass, rdp_port = state["os_url"], state["rdp_pass"], state["rdp_port"]
 
-    data = context.user_data
-    ip = data["ip"]
-    root_pass = data["root_pass"]
-    os_img = data["os"]
-    rdp_pass = data["rdp_pass"]
-    rdp_port = data["rdp_port"]
-
-    await query.edit_message_text("🚀 Memulai reinstall VPS...")
+    await query.edit_message_text("🔄 Menjalankan reinstall di VPS...")
 
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, username="root", password=root_pass, timeout=20)
 
-        if os_img == "Custom ISO":
-            iso_url = "https://example.com/custom.iso"  # bisa diganti untuk input manual
-        else:
-            iso_url = OS_OPTIONS[os_img]
-
-        cmd = f"bash reinstall.sh dd --rdp-port {rdp_port} --password '{rdp_pass}' --img '{iso_url}'"
+        cmd = f"bash reinstall.sh dd --rdp-port {rdp_port} --password {rdp_pass} --img {os_url}"
         stdin, stdout, stderr = ssh.exec_command(cmd)
-
-        output = stdout.read().decode()
-        error = stderr.read().decode()
+        output = stdout.read().decode() + stderr.read().decode()
         ssh.close()
 
-        msg = (
-            f"✅ Reinstall VPS berhasil dijalankan!\n\n"
-            f"📡 IP VPS: {ip}\n"
-            f"🖥️ OS: {os_img}\n"
-            f"🔐 RDP Pass: {rdp_pass}\n"
-            f"🔌 RDP Port: {rdp_port}\n\n"
-            f"🌍 Cek progress reinstall di browser:\nhttp://{ip}\n"
-        )
+        msg = f"✅ Reinstall dijalankan di {ip}\n\nCek progres: http://{ip}"
         if output:
-            msg += f"\n📝 Log:\n<code>{output[:400]}</code>"
-        if error:
-            msg += f"\n⚠️ Error:\n<code>{error[:400]}</code>"
-
-        await query.edit_message_text(msg, parse_mode="HTML")
-
+            msg += f"\n\nLog awal:\n{output[:500]}..."  # potong biar gak kepanjangan
+        await query.message.reply_text(msg)
     except Exception as e:
-        await query.edit_message_text(f"❌ Gagal reinstall VPS:\n{str(e)}")
+        await query.message.reply_text(f"❌ Gagal reinstall VPS: {e}")
 
-    return ConversationHandler.END
-
-# --- MAIN ---
+# --- Main ---
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("warn", warn_command)],
-        states={
-            CHOOSE_OS: [CallbackQueryHandler(choose_os, pattern="^os\\|")],
-            CHOOSE_PASS: [
-                CallbackQueryHandler(choose_pass, pattern="^pass\\|"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_pass),
-            ],
-            CHOOSE_PORT: [
-                CallbackQueryHandler(choose_port, pattern="^port\\|"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, save_port),
-            ],
-            CONFIRM: [CallbackQueryHandler(do_reinstall, pattern="^confirm\\|")],
-        },
-        fallbacks=[],
-    )
+    app.add_handler(CommandHandler("warn", warn))
+    app.add_handler(CallbackQueryHandler(choose_os, pattern="^os_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_url))
+    app.add_handler(CallbackQueryHandler(choose_pass, pattern="^pass_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pass_input))
+    app.add_handler(CallbackQueryHandler(choose_port, pattern="^port_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_port_input))
+    app.add_handler(CallbackQueryHandler(do_reinstall, pattern="^do_reinstall$"))
 
-    app.add_handler(conv_handler)
     app.run_polling()
 
 if __name__ == "__main__":
